@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fake_cmd"
-version = "0.0.6"
+version = "0.0.7"
 description = "fake_cmd provides a simulated remote command line based on file communication to send commands from the client to the server for execution."
 readme = "README.md"
 license = "MIT"
