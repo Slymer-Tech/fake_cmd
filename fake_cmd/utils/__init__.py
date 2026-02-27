@@ -22,9 +22,15 @@ class Config:
         # to avoid new files piling up in the long term.
         self.cmd_pipe_read_timeout: float = 0.03
         self.cmd_pipe_read_timeout_when_terminate: float = 0.5
-        # Limit on the number of files.
+        # Limit on the number of files (for MessageHandler).
         self.max_message_files: int = 1000
         self.max_output_files: int = 1000
+        # Maximum size (bytes) of the single output file before the
+        # server truncates it.  Client-read data is already displayed
+        # and won't be needed again, so truncation only loses output
+        # that the client hasn't fetched yet (similar to the old
+        # ``max_output_files`` behaviour).  Default: 50 MiB.
+        self.max_output_file_bytes: int = 50 * 1024 * 1024
         # command pipe output encoding method.
         self.cmd_pipe_encoding: str = 'utf-8'
         self.cmd_executable: Union[str, None] = None

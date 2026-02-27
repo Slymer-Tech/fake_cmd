@@ -369,6 +369,8 @@ class SequenceFileHandler(
         """
         return os.path.join(self.namespace, fname)
     
+    _NFS_SENTINEL = '.nfs_cache_refresh'
+
     def detect_files(self) -> None:
         """
         Detect and sort new files in the namespace, and add them 
@@ -377,10 +379,15 @@ class SequenceFileHandler(
         if not self.check_namespace():
             return
         
+        self._invalidate_dir_cache()
+        
         with self.fp_queue_lock:
-            # Filter writer lock files.
+            # Filter writer lock files and NFS sentinel.
             fname_iter = filter(
-                lambda fname: not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION),
+                lambda fname: (
+                    not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION) and
+                    fname != self._NFS_SENTINEL
+                ),
                 os.listdir(self.namespace)
             )
             # Sort the file names.
@@ -389,6 +396,20 @@ class SequenceFileHandler(
             self.fp_queue.extend(
                 filterfalse(check_single_writer_lock, map(self.get_fp, fname_list))
             )
+    
+    def _invalidate_dir_cache(self) -> None:
+        """
+        Force NFS/network FS to refresh its directory entry cache by
+        creating and removing a sentinel file.  The CREATE RPC forces
+        the NFS client to discard cached readdir results.
+        """
+        sentinel = self.get_fp(self._NFS_SENTINEL)
+        try:
+            fd = os.open(sentinel, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+            os.close(fd)
+            os.remove(sentinel)
+        except Exception:
+            pass
     
     @abstractmethod
     def sort(self, fname_iter: Iterable[str]) -> List[str]:
@@ -409,72 +430,151 @@ class SequenceFileHandler(
         return namespace_exists
 
 
-class OutputFileHandler(SequenceFileHandler):
+class OutputFileHandler:
     """
-    OutputFileHandler is used for stdout and stderr content 
-    writing/reading.
+    Single-file output handler for stdout/stderr content.
+    
+    Instead of creating many small files (one per output chunk) and
+    relying on directory listing to detect them, this handler appends
+    all output to a single file and tracks read offsets.
+    
+    I/O comparison (for N output chunks):
+        Old: N file creates + N os.listdir + N file reads + N file deletes
+        New: N appends to 1 file + N seeks/reads on 1 file
+    
+    NFS safety: relies on close-to-open consistency.  The server closes
+    the file after each append; the client opens it fresh for each read.
+    This guarantees the client always sees the latest data without
+    attribute-cache delays.
+    
+    File-size control: when the file exceeds ``config.max_output_file_bytes``,
+    the server truncates and overwrites.  The client detects truncation
+    (file size < read offset) and resets automatically.
     """
-    # Separator to separate the fname components. Used 
-    # for file sorting.
-    fname_sep = '__'
+    _CONTENT_FNAME = 'output.dat'
     
     def __init__(self, namespace: str):
-        SequenceFileHandler.__init__(
-            self,
-            namespace=namespace,
-            max_files=config.max_output_files
-        )
+        self.namespace = namespace
+        os.makedirs(namespace, exist_ok=True)
+        self._content_fp = os.path.join(namespace, self._CONTENT_FNAME)
+        self._read_offset: int = 0
+        self._decode_buffer: bytes = b''
+        try:
+            self._written_bytes: int = os.path.getsize(self._content_fp)
+        except OSError:
+            self._written_bytes: int = 0
     
-    def write(self, content: str, exist_ok: bool = False):
+    def write(self, content: str, exist_ok: bool = False) -> Union[bool, Missing]:
+        """Append *content* to the single output file.
+        
+        When the file exceeds ``config.max_output_file_bytes`` the
+        server truncates via atomic rename (write tmp → rename) so
+        the client never sees a half-written/empty file.  The client
+        detects truncation (file size < read offset) and resets.
         """
-        Write a new file with timestamp name.
-        """
-        return super().write(
-            fname=self.gen_fname(),
-            content=content,
-            exist_ok=exist_ok
-        )
+        if not content:
+            return MISSING
+        
+        data = content.encode('utf-8')
+        try:
+            if self._written_bytes > config.max_output_file_bytes:
+                tmp_fp = self._content_fp + '.truncating'
+                with open(tmp_fp, 'wb') as f:
+                    f.write(data)
+                os.replace(tmp_fp, self._content_fp)
+                self._written_bytes = len(data)
+            else:
+                with open(self._content_fp, 'ab') as f:
+                    f.write(data)
+                self._written_bytes += len(data)
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
+            return False
+        return True
     
     def print(self, content: str, exist_ok: bool = False):
         return self.write(f'{content}\n', exist_ok=exist_ok)
     
-    def sort(self, fname_iter: Iterable[str]) -> List[str]:
+    def read_one(
+        self,
+        detect_new_files: bool = True
+    ) -> Union[str, Literal[False]]:
         """
-        Sort the output file names by timestamps.
-        """
-        def get_timestamp(fname: str) -> float:
-            """
-            Get timestamp from the file path.
-            """
-            return float(fname.split(OutputFileHandler.fname_sep)[0])
+        Read all content appended since the last read and return it
+        as a single string.  Returns ``False`` when no new data is
+        available.
         
-        def filter_valid_fname(fname: str) -> bool:
-            """
-            Only keep the valid fname.
-            """
-            try:
-                get_timestamp(fname)
-            except Exception:
-                remove_file_with_retry(self.get_fp(fname))
-                return False
+        ``detect_new_files``:  When ``False``, only flush previously
+        buffered partial UTF-8 bytes (used by ``read_all`` after its
+        timeout expires so it stops pulling new data from disk).
+        """
+        if not detect_new_files:
+            if self._decode_buffer:
+                text = self._decode_buffer.decode('utf-8', errors='replace')
+                self._decode_buffer = b''
+                return text if text else False
+            return False
+        
+        try:
+            with open(self._content_fp, 'rb') as f:
+                # Detect server-side truncation: if the file is now
+                # smaller than our read offset, the server has reset
+                # the file.  Discard any stale decode buffer and
+                # start reading from 0.
+                file_size = f.seek(0, 2)
+                if file_size < self._read_offset:
+                    self._read_offset = 0
+                    self._decode_buffer = b''
+                f.seek(self._read_offset)
+                data = f.read()
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.error(str(e), stack_info=True)
+            return False
+        
+        if not data:
+            return False
+        
+        if self._decode_buffer:
+            data = self._decode_buffer + data
+            self._decode_buffer = b''
+        
+        try:
+            text = data.decode('utf-8')
+            self._read_offset += len(data)
+        except UnicodeDecodeError as e:
+            if e.start > 0:
+                text = data[:e.start].decode('utf-8')
+                self._decode_buffer = data[e.start:]
+                self._read_offset += e.start
             else:
-                return True
+                self._decode_buffer = data
+                return False
         
-        return sorted(
-            filter(filter_valid_fname, fname_iter),
-            key=lambda fp: get_timestamp(fp)
-        )
+        return text if text else False
     
-    def gen_fname(self) -> str:
-        """
-        Generate a unique file name with timestamp for sorting.
-        """
-        # The order of output files strongly rely on the accurate time, 
-        # so we use ``time.time_ns`` here.
-        return (
-            f'{time.time_ns()}{OutputFileHandler.fname_sep}'
-            f'{uuid_base36(uuid.uuid4().int)}.out'
-        )
+    def read_all(
+        self,
+        timeout: Union[float, Missing] = MISSING
+    ) -> str:
+        """Read all remaining content (until no more data or *timeout*)."""
+        content = ''
+        detect_new_files = True
+        start = time.time()
+        while True:
+            c = self.read_one(detect_new_files=detect_new_files)
+            if c is False:
+                return content
+            content += c
+            if (
+                timeout is not MISSING and
+                (time.time() - start) > timeout
+            ):
+                detect_new_files = False
+    
+    def check_namespace(self, silent: bool = True) -> bool:
+        return os.path.exists(self.namespace)
 
 
 class MessageHandler(SequenceFileHandler):

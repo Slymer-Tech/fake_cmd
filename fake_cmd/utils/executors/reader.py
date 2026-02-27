@@ -1,3 +1,4 @@
+import os
 import re
 import selectors
 import subprocess
@@ -161,7 +162,11 @@ class PipePopenReader(PopenReader):
     def read(self, timeout: float) -> str:
         content = ''
         for _ in timeout_loop(timeout):
-            content += self._selector_read_one()
+            chunk = self._selector_read_one()
+            if chunk:
+                content += chunk
+            elif content:
+                break
         return content
 
     def read_all(self) -> str:
@@ -180,15 +185,20 @@ class PipePopenReader(PopenReader):
 
     def _selector_read_one(self) -> str:
         """
-        Read one char if selector is ready.
+        Read available data from stdout if selector is ready.
+        Uses os.read for non-blocking chunk reads instead of
+        single-byte reads to drastically reduce syscall overhead.
         """
-        # Non-blocking mode.
         stdout = self.executor.stdout
         for key, _ in self.selector.select(0):
             if key.fileobj == stdout:
-                # If ready, read one char and return.
-                return self.bytes_parser.parse(stdout.read(1))
-        # If no output, directly return empty str.
+                try:
+                    data = os.read(stdout.fileno(), 65536)
+                except OSError:
+                    return ''
+                if not data:
+                    return ''
+                return self.bytes_parser.parse(data)
         return ''
     
     def get_popen_stdout(self):
