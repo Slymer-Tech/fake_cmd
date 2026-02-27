@@ -35,6 +35,7 @@ from fake_cmd.utils.comm import (
     Heartbeat,
     CommandMessage,
     MessageHandler,
+    MessageChannel,
     OutputFileHandler
 )
 from fake_cmd.utils.common import get_server_name, polling, uuid_base36
@@ -661,8 +662,8 @@ class Client(
         self.state = State()
         self.cli = cli
         self.server_writer = MessageHandler(self.session_info.server_listen_namespace)
-        self.session_writer = MessageHandler(self.session_info.session_queue_namespace)
-        self.client_listener = MessageHandler(self.session_info.client_queue_namespace)
+        self.session_writer = MessageChannel(self.session_info.session_queue_namespace)
+        self.client_listener = MessageChannel(self.session_info.client_queue_namespace)
         self.server_version: Union[Tuple[int, int, int], None] = None
         self.version_strict: bool = True
     

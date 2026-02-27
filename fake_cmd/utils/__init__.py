@@ -10,26 +10,22 @@ class Config:
     def __init__(self) -> None:
         # Common polling interval
         self.polling_interval: float = 0.25
-        # NOTE: The cmd is responsible for content output, 
-        # so the polling interval should be short.
-        self.cmd_polling_interval: float = 0.02
-        # Read the subprocess pipe output within the timeout 
-        # and return.
-        # NOTE: This should be slightly larger than the 
-        # ``cmd_polling_interval``, because this value determines 
-        # how fast a new output file is created, and it should 
-        # be slower than the client consuming the output files 
-        # to avoid new files piling up in the long term.
+        # Polling interval for the command execution loop (both
+        # client output reading and server pipe draining).  0.1s
+        # balances NFS I/O pressure vs. perceived latency.  Worst-
+        # case output delay is ~2× this value.
+        self.cmd_polling_interval: float = 0.1
+        # How long the server blocks draining the subprocess pipe
+        # per cycle.  Keep this short so ``_process_kill_signals``
+        # is checked promptly; the single-file output model no
+        # longer requires this to exceed ``cmd_polling_interval``.
         self.cmd_pipe_read_timeout: float = 0.03
         self.cmd_pipe_read_timeout_when_terminate: float = 0.5
         # Limit on the number of files (for MessageHandler).
         self.max_message_files: int = 1000
-        self.max_output_files: int = 1000
-        # Maximum size (bytes) of the single output file before the
-        # server truncates it.  Client-read data is already displayed
-        # and won't be needed again, so truncation only loses output
-        # that the client hasn't fetched yet (similar to the old
-        # ``max_output_files`` behaviour).  Default: 50 MiB.
+        # Maximum size (bytes) of a single-file channel
+        # (OutputFileHandler / MessageChannel) before the writer
+        # truncates it.  Default: 50 MiB.
         self.max_output_file_bytes: int = 50 * 1024 * 1024
         # command pipe output encoding method.
         self.cmd_pipe_encoding: str = 'utf-8'
@@ -42,7 +38,6 @@ class Config:
         self.server_shutdown_wait_timeout: float = 5.0
         # Common symbol timeouts.
         self.symbol_wait_timeout: float = 5.0
-        self.symbol_remove_timeout: float = 0.01
         # Retries
         self.msg_send_retries: int = 3
         self.msg_confirm_wait_timeout: float = 3.0

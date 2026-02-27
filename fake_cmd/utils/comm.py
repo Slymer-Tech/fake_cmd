@@ -6,7 +6,6 @@ import json
 import time
 import uuid
 import random
-from itertools import filterfalse
 from threading import RLock
 from abc import ABC, abstractmethod, ABCMeta
 from slime_core.utils.base import (
@@ -37,8 +36,6 @@ from .exception import retry_deco
 from .logging import logger
 from .file import (
     remove_file_with_retry,
-    check_single_writer_lock,
-    single_writer_lock,
     SINGLE_WRITER_LOCK_FILE_EXTENSION
 )
 
@@ -205,6 +202,29 @@ class CommandMessage(Message):
         return self.get_content_item('kill_disabled', False)
 
 #
+# Directory cache helpers.
+#
+
+_DIR_CACHE_SENTINEL = '.cache_refresh'
+
+
+def invalidate_dir_cache(directory: str) -> None:
+    """
+    Force the OS / network FS to refresh its directory-entry and
+    negative-dentry caches by creating and immediately removing a
+    sentinel file.  On network file systems (e.g. NFS) this
+    invalidates cached READDIR and LOOKUP results; on local file
+    systems the operation is harmless.
+    """
+    sentinel = os.path.join(directory, _DIR_CACHE_SENTINEL)
+    try:
+        fd = os.open(sentinel, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        os.close(fd)
+        os.remove(sentinel)
+    except Exception:
+        pass
+
+#
 # File Handlers.
 #
 
@@ -324,7 +344,7 @@ class SequenceFileHandler(
         empty_ok: bool = False
     ) -> Union[bool, Missing, Stop]:
         """
-        Safely write a file with single writer lock. 
+        Safely write a file using atomic rename (tmp → target). 
         Return whether the writing operation succeeded.
         """
         if not self.check_namespace():
@@ -355,8 +375,10 @@ class SequenceFileHandler(
             return False
         
         try:
-            with single_writer_lock(fp), open(fp, 'w') as f:
+            tmp_fp = fp + '.tmp'
+            with open(tmp_fp, 'w') as f:
                 f.write(content)
+            os.replace(tmp_fp, fp)
         except Exception as e:
             logger.error(str(e), stack_info=True)
             return False
@@ -369,8 +391,6 @@ class SequenceFileHandler(
         """
         return os.path.join(self.namespace, fname)
     
-    _NFS_SENTINEL = '.nfs_cache_refresh'
-
     def detect_files(self) -> None:
         """
         Detect and sort new files in the namespace, and add them 
@@ -379,37 +399,19 @@ class SequenceFileHandler(
         if not self.check_namespace():
             return
         
-        self._invalidate_dir_cache()
+        invalidate_dir_cache(self.namespace)
         
         with self.fp_queue_lock:
-            # Filter writer lock files and NFS sentinel.
             fname_iter = filter(
                 lambda fname: (
+                    not fname.endswith('.tmp') and
                     not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION) and
-                    fname != self._NFS_SENTINEL
+                    fname != _DIR_CACHE_SENTINEL
                 ),
                 os.listdir(self.namespace)
             )
-            # Sort the file names.
             fname_list = self.sort(fname_iter)
-            # Get the full file paths and filter files with writer lock.
-            self.fp_queue.extend(
-                filterfalse(check_single_writer_lock, map(self.get_fp, fname_list))
-            )
-    
-    def _invalidate_dir_cache(self) -> None:
-        """
-        Force NFS/network FS to refresh its directory entry cache by
-        creating and removing a sentinel file.  The CREATE RPC forces
-        the NFS client to discard cached readdir results.
-        """
-        sentinel = self.get_fp(self._NFS_SENTINEL)
-        try:
-            fd = os.open(sentinel, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-            os.close(fd)
-            os.remove(sentinel)
-        except Exception:
-            pass
+            self.fp_queue.extend(map(self.get_fp, fname_list))
     
     @abstractmethod
     def sort(self, fname_iter: Iterable[str]) -> List[str]:
@@ -689,12 +691,15 @@ class MessageHandler(SequenceFileHandler):
         
         def filter_valid_fname(fname: str) -> bool:
             """
-            Only keep the valid fname.
+            Only keep the valid fname.  Do NOT remove ``.confirm``
+            files—they are confirmation symbols that the sender
+            polls for and must remain on disk until consumed.
             """
             try:
                 get_timestamp(fname)
             except Exception:
-                remove_file_with_retry(self.get_fp(fname))
+                if not fname.endswith('.confirm'):
+                    remove_file_with_retry(self.get_fp(fname))
                 return False
             else:
                 return True
@@ -704,6 +709,126 @@ class MessageHandler(SequenceFileHandler):
             key=lambda fp: get_timestamp(fp)
         )
 
+
+class MessageChannel:
+    """
+    Single-file message channel for one-to-one communication.
+
+    Uses the same append + offset-tracking pattern as
+    ``OutputFileHandler``, but serialises ``Message`` objects as
+    newline-delimited JSON (one JSON object per line).
+
+    I/O comparison with ``MessageHandler`` (for N messages):
+        Old: N file creates + N listdir + N reads + N deletes + N confirms
+        New: N appends to 1 file + N offset-based reads from 1 file
+
+    Safety: relies on close-to-open consistency—writer closes the
+    file after each append; reader opens it fresh for each read.
+    ``json.dumps`` escapes literal newlines, so ``\\n`` in the file
+    is always a reliable message boundary.
+    """
+    _CONTENT_FNAME = 'channel.dat'
+
+    def __init__(self, namespace: str):
+        self.namespace = namespace
+        os.makedirs(namespace, exist_ok=True)
+        self._content_fp = os.path.join(namespace, self._CONTENT_FNAME)
+        self._read_offset: int = 0
+        self._pending_messages: List[Message] = []
+        try:
+            self._written_bytes: int = os.path.getsize(self._content_fp)
+        except OSError:
+            self._written_bytes: int = 0
+
+    # ------------------------------------------------------------------
+    # Writer side
+    # ------------------------------------------------------------------
+
+    def write(self, msg: Message) -> bool:
+        """Append *msg* as a single JSON line.
+
+        When the file exceeds ``config.max_output_file_bytes`` the
+        writer truncates via atomic rename so the reader never sees
+        a half-written file.  The reader detects truncation
+        (file size < read offset) and resets automatically.
+        """
+        data = (msg.to_json() + '\n').encode('utf-8')
+        try:
+            if self._written_bytes > config.max_output_file_bytes:
+                tmp_fp = self._content_fp + '.truncating'
+                with open(tmp_fp, 'wb') as f:
+                    f.write(data)
+                os.replace(tmp_fp, self._content_fp)
+                self._written_bytes = len(data)
+            else:
+                with open(self._content_fp, 'ab') as f:
+                    f.write(data)
+                self._written_bytes += len(data)
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Reader side
+    # ------------------------------------------------------------------
+
+    def read_one(self) -> Union[Message, Literal[False]]:
+        """Return the next unread message, or ``False`` if none."""
+        if not self._pending_messages:
+            self._fetch_messages()
+        if self._pending_messages:
+            return self._pending_messages.pop(0)
+        return False
+
+    def _fetch_messages(self) -> None:
+        """Read new data from disk and buffer complete JSON lines."""
+        try:
+            with open(self._content_fp, 'rb') as f:
+                file_size = f.seek(0, 2)
+                if file_size < self._read_offset:
+                    self._read_offset = 0
+                f.seek(self._read_offset)
+                data = f.read()
+        except (FileNotFoundError, OSError):
+            return
+
+        if not data:
+            return
+
+        last_newline = data.rfind(b'\n')
+        if last_newline == -1:
+            return
+
+        complete_data = data[:last_newline + 1]
+        self._read_offset += len(complete_data)
+
+        text = complete_data.decode('utf-8', errors='replace')
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = Message.from_json(line)
+                self._pending_messages.append(msg)
+            except Exception as e:
+                logger.error(
+                    f'Failed to parse channel message: {e}',
+                    stack_info=True
+                )
+
+    # ------------------------------------------------------------------
+    # Common
+    # ------------------------------------------------------------------
+
+    def check_namespace(self, silent: bool = True) -> bool:
+        namespace_exists = os.path.exists(self.namespace)
+        if not namespace_exists and not silent:
+            logger.warning(
+                f'Namespace "{self.namespace}" does not exist.'
+            )
+        return namespace_exists
+
 #
 # Symbol operations.
 #
@@ -712,12 +837,16 @@ class MessageHandler(SequenceFileHandler):
 def create_symbol(fp: str):
     """
     Create a symbol file. If ``fp`` exists, then do nothing.
+    Uses atomic rename so the file appears fully on NFS
+    without a transient ``.writing`` lock file.
     """
     if os.path.exists(fp):
         return
     
-    with single_writer_lock(fp), open(fp, 'a'):
-        pass
+    tmp_fp = fp + '.tmp'
+    fd = os.open(tmp_fp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+    os.close(fd)
+    os.replace(tmp_fp, fp)
 
 
 def wait_symbol(
@@ -733,11 +862,13 @@ def wait_symbol(
     removing the symbol or creating the symbol.
     """
     timeout = config.symbol_wait_timeout if timeout is MISSING else timeout
+    parent_dir = os.path.dirname(fp)
     
     for _ in timeout_loop(
         timeout,
         interval=config.polling_interval
     ):
+        invalidate_dir_cache(parent_dir)
         if xor__(
             os.path.exists(fp),
             wait_for_remove
@@ -751,10 +882,6 @@ def remove_symbol(fp: str) -> None:
     """
     Remove a symbol file.
     """
-    if check_single_writer_lock(fp):
-        # If the file has a single writer lock, sleep a little 
-        # amount of time and then remove.
-        time.sleep(config.symbol_remove_timeout)
     remove_file_with_retry(fp)
 
 

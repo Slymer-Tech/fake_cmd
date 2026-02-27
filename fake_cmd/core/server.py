@@ -36,6 +36,7 @@ from fake_cmd.utils.comm import (
     Heartbeat,
     CommandMessage,
     MessageHandler,
+    MessageChannel,
     OutputFileHandler
 )
 from fake_cmd.utils.common import polling, timestamp_to_str
@@ -342,8 +343,8 @@ class Session(
         # file initialization
         self.session_info.init_session()
         # Message communication
-        self.session_listener = MessageHandler(self.session_info.session_queue_namespace)
-        self.client_writer = MessageHandler(self.session_info.client_queue_namespace)
+        self.session_listener = MessageChannel(self.session_info.session_queue_namespace)
+        self.client_writer = MessageChannel(self.session_info.client_queue_namespace)
         logger.info(f'Session {self.session_id} created.')
     
     @property
