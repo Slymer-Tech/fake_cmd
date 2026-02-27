@@ -3,7 +3,8 @@ import time
 from multiprocessing import (
     Process,
     Event as MPEvent,
-    RLock as MPRLock
+    RLock as MPRLock,
+    Queue as MPQueue
 )
 from threading import Thread, Event, RLock
 from abc import ABCMeta
@@ -118,6 +119,10 @@ class CommandState(ReadonlyAttr):
         self.queued = MPEvent()
         self.scheduled = MPEvent()
         self.scheduled_lock = MPRLock()
+        # Executor state visible to the parent (session) process.
+        self.executor_started = MPEvent()
+        self.executor_writable = MPEvent()
+        self.input_queue: MPQueue = MPQueue()
     
     @property
     def pending_terminate(self) -> bool:
@@ -522,20 +527,21 @@ class Session(
             if not running_cmd:
                 return
             
-            executor = running_cmd.executor
-            if not executor.writable():
+            cmd_state = running_cmd.cmd_state
+            if not cmd_state.executor_writable.is_set():
                 self.info_client(f'Input failed: Current cmd {str(running_cmd)} does not accept input.')
                 return
-            if not executor.is_started():
+            if not cmd_state.executor_started.is_set():
                 self.info_client(f'Input failed: Command {str(running_cmd)} has not started yet.')
                 return
-            if not executor.is_running():
+            if cmd_state.finished.is_set() or cmd_state.exit.is_set():
                 self.info_client(f'Input failed: Command {str(running_cmd)} is not running.')
                 return
             
-            # Write to the cmd.
-            res = executor.write_line(input_str)
-            if not res:
+            # Enqueue input for the child process to pick up.
+            try:
+                running_cmd.cmd_state.input_queue.put(input_str)
+            except OSError:
                 self.info_client(f'Interactive input failed: "{input_str}".')
     
     def running_cmd_check(self, cmd_id: str) -> Union["SessionCommand", Literal[False]]:
@@ -1150,12 +1156,30 @@ class ShellCommand(SessionCommand):
                     executor.close_write()
                     writer_closed = True
         
+        import queue as _queue
+        
+        def _process_input():
+            """Drain the input queue and feed lines to the executor."""
+            if not executor.writable() or not executor.is_running():
+                return
+            while True:
+                try:
+                    line = state.input_queue.get_nowait()
+                except _queue.Empty:
+                    break
+                executor.write_line(line)
+        
         with executor:
+            state.executor_started.set()
+            if executor.writable():
+                state.executor_writable.set()
+            
             for _ in polling(config.cmd_polling_interval):
                 # NOTE: DO NOT return after the signal is sent, 
                 # and it should always wait until the process 
                 # quits.
                 _process_kill_signals()
+                _process_input()
                 # Write outputs.
                 self.output_writer.write(
                     executor.read(config.cmd_pipe_read_timeout)
