@@ -930,7 +930,14 @@ class Connection(ABC):
 
 class Heartbeat(ReadonlyAttr):
     """
-    Used heartbeat to confirm the connection is still alive.
+    Timestamp-based heartbeat that avoids file creation / deletion
+    churn.  Each side overwrites a single persistent file with the
+    current ``time.time()``; the other side reads it to check
+    liveness.
+
+    Compared to the old create-symbol / check-symbol approach (which
+    created and deleted a file every interval), this touches at most
+    two files that live for the entire session lifetime.
     """
     readonly_attr__ = (
         'receive_fp',
@@ -946,34 +953,37 @@ class Heartbeat(ReadonlyAttr):
         send_fp: str
     ) -> None:
         self.receive_fp: str = receive_fp
-        self.last_receive: Union[float, None] = None
         self.send_fp: str = send_fp
+        self.last_receive: Union[float, None] = None
         # Initialized to ``LessThanAnything``.
         self.last_beat: Union[float, LessThanAnything] = LessThanAnything()
         self.min_interval: float = config.heartbeat_min_interval
         self.max_interval: float = config.heartbeat_max_interval
         self.timeout: float = config.heartbeat_timeout
+        # Track the last remote timestamp we observed so we can
+        # detect whether the remote side has written a newer one.
+        self._last_remote_ts: float = 0.0
         self.set_interval()
     
     def beat(self) -> bool:
         now = time.time()
         if self.last_receive is None:
-            # Set ``last_receive`` to now if it is None, because 
-            # if the heartbeat never receives and ``last_receive`` 
-            # is always None, we will never know when the timeout 
-            # reaches. Set here rather than in the ``__init__``, 
-            # because there may be a period of time between the 
-            # Heartbeat object creation and the first beat (although 
-            # most of the time it is short).
+            # Grace-period start: set on first beat so the timeout
+            # countdown doesn't begin until we actually start checking.
             self.last_receive = now
         
         if self.last_beat > (now - self.interval):
-            # If within the interval, do not check and directly 
-            # return True.
             return True
         
-        create_symbol(self.send_fp)
-        received = check_symbol(self.receive_fp)
+        # Send: overwrite our file with the current timestamp.
+        try:
+            with open(self.send_fp, 'w') as f:
+                f.write(str(now))
+        except OSError:
+            pass
+        
+        # Receive: read the remote side's timestamp.
+        received = self._check_receive()
         if received:
             self.last_receive = now
         elif (now - self.last_receive) > self.timeout:
@@ -983,9 +993,20 @@ class Heartbeat(ReadonlyAttr):
             return False
 
         self.last_beat = now
-        # Set a new random interval after beat.
         self.set_interval()
         return True
+    
+    def _check_receive(self) -> bool:
+        """Return ``True`` if the remote side has written a newer timestamp."""
+        try:
+            with open(self.receive_fp, 'r') as f:
+                remote_ts = float(f.read().strip())
+        except (OSError, ValueError):
+            return False
+        if remote_ts > self._last_remote_ts:
+            self._last_remote_ts = remote_ts
+            return True
+        return False
     
     def set_interval(self) -> float:
         """

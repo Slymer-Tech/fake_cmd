@@ -95,6 +95,10 @@ class CommandPool(ReadonlyAttr):
         # NOTE: ``with (A, B): pass`` will raise exception in Python 3.7, 
         # while ``with A, B: pass`` is ok.
         with self.queue_lock, self.execute_lock:
+            # Reap finished commands (Thread or Process) so that
+            # ``len(self.execute)`` reflects the true concurrency.
+            self.execute = [c for c in self.execute if c.is_alive()]
+            
             while (
                 self.queue and 
                 self.max_threads > len(self.execute)
@@ -109,14 +113,6 @@ class CommandPool(ReadonlyAttr):
                         # Double-check to make it safe.
                         continue
                 
-                    def terminate_func(*args):
-                        with self.execute_lock:
-                            try:
-                                self.execute.remove(cmd)
-                            except ValueError:
-                                pass
-                    
-                    cmd.add_exit_callback__(terminate_func)
                     self.execute.append(cmd)
                     cmd.start()
                     # Using a scheduled lock, it can ensure that when 

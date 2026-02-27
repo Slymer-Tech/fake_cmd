@@ -1,5 +1,10 @@
 import os
 import time
+from multiprocessing import (
+    Process,
+    Event as MPEvent,
+    RLock as MPRLock
+)
 from threading import Thread, Event, RLock
 from abc import ABCMeta
 from slime_core.utils.common import FuncParams
@@ -63,7 +68,7 @@ from fake_cmd.utils.executors.reader import (
 from fake_cmd.utils.executors.writer import PopenWriter, popen_writer_registry
 from fake_cmd.utils.exception import ServerShutdown, ignore_keyboard_interrupt
 from fake_cmd.utils.logging import logger
-from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
+from . import ServerInfo, SessionInfo, SESSION_ID_SUFFIX, dispatch_action, ActionFunc, param_check
 
 #
 # States
@@ -72,12 +77,10 @@ from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 class SessionState(ReadonlyAttr):
     
     readonly_attr__ = (
-        'destroy_local',
-        'unable_to_communicate'
+        'unable_to_communicate',
     )
     
     def __init__(self) -> None:
-        self.destroy_local = Event()
         # Unable to communicate to client, so in 
         # ``clear_cache``, it will clear the namespace 
         # ignoring whether the client has already 
@@ -102,31 +105,19 @@ class CommandState(ReadonlyAttr):
     )
     
     def __init__(self) -> None:
-        # Keyboard interrupt from remote.
-        self.keyboard_interrupt = Event()
-        # Whether keyboard interrupt is not used to kill the command.
-        self.kill_disabled = Event()
-        # Terminate from local.
-        self.terminate_local = Event()
-        # Terminate from remote.
-        self.terminate_remote = Event()
-        # Terminate because of disconnection.
-        self.terminate_disconnect = Event()
-        # Force kill.
-        self.force_kill = Event()
-        # Mark that the command normally finished.
-        self.finished = Event()
-        # Mark that the command finally exit, whether through itself 
-        # or by manual termination (usually because the command is 
-        # terminated before being scheduled).
-        self.exit = Event()
-        # Command is queued. Used only to decide whether to 
-        # notify the client that the task is queued.
-        self.queued = Event()
-        # The command is scheduled. Compared to ``queued``, it 
-        # is more safe because of using a ``RLock``.
-        self.scheduled = Event()
-        self.scheduled_lock = RLock()
+        # Uses multiprocessing primitives so that CommandState can be
+        # shared between the session process and command child processes.
+        self.keyboard_interrupt = MPEvent()
+        self.kill_disabled = MPEvent()
+        self.terminate_local = MPEvent()
+        self.terminate_remote = MPEvent()
+        self.terminate_disconnect = MPEvent()
+        self.force_kill = MPEvent()
+        self.finished = MPEvent()
+        self.exit = MPEvent()
+        self.queued = MPEvent()
+        self.scheduled = MPEvent()
+        self.scheduled_lock = MPRLock()
     
     @property
     def pending_terminate(self) -> bool:
@@ -153,7 +144,7 @@ class Server(
     readonly_attr__ = (
         'server_info',
         'session_dict',
-        'cmd_pool'
+        'max_cmds'
     )
     
     # Dispatch different message types.
@@ -166,8 +157,8 @@ class Server(
     ) -> None:
         LifecycleRun.__init__(self)
         self.server_info = ServerInfo(address)
-        self.session_dict: Dict[str, Session] = {}
-        self.cmd_pool = CommandPool(max_cmds)
+        self.session_dict: Dict[str, Process] = {}
+        self.max_cmds = max_cmds
         self.server_listener: Union[MessageHandler, Nothing] = NOTHING
     
     #
@@ -190,8 +181,6 @@ class Server(
         self.server_info.init_server()
         # Init server listener
         self.server_listener = MessageHandler(self.server_info.server_listen_namespace)
-        # NOTE: Open cmd_pool here.
-        self.cmd_pool.start()
         logger.info(f'Server initialized. Address {address} created.')
         return True
 
@@ -215,24 +204,30 @@ class Server(
     def after_running(self, *args):
         with ignore_keyboard_interrupt():
             logger.info('Server shutting down...')
-            self.cmd_pool.pool_close.set()
-            # Destroy sessions.
-            # Use a new tuple, because the ``exit_callback`` will pop 
-            # the dict items.
-            sessions = tuple(self.session_dict.values())
-            for session in sessions:
-                session.session_state.destroy_local.set()
+            # Signal all session processes to destroy via file-based signaling.
+            for session_id in list(self.session_dict.keys()):
+                destroy_fp = SessionInfo(
+                    self.server_info.address, session_id
+                ).destroy_session_fp
+                try:
+                    create_symbol(destroy_fp)
+                except Exception:
+                    pass
             logger.info('Waiting sessions to destroy...')
-            for session in sessions:
-                session.join(config.server_shutdown_wait_timeout)
-            # Kill all the commands in the command pool.
-            for cmd in tuple(self.cmd_pool.update_and_get_execute()):
-                cmd.executor.kill()
-            # Check the shutdown state.
-            if any(map(lambda session: session.is_alive(), sessions)):
+            processes = list(self.session_dict.values())
+            for process in processes:
+                process.join(config.server_shutdown_wait_timeout)
+            # Force-terminate remaining session processes.
+            alive = [p for p in processes if p.is_alive()]
+            if alive:
                 logger.warning(
-                    'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
+                    'Warning: there are still sessions undestroyed. '
+                    'Terminating remaining session processes...'
                 )
+                for p in alive:
+                    p.terminate()
+                for p in alive:
+                    p.join(timeout=5)
             else:
                 logger.info('Successfully shutdown. Bye.')
             self.server_info.clear_server()
@@ -241,25 +236,22 @@ class Server(
     def create_new_session(self, msg: Message):
         session_id = msg.session_id
         
-        def destroy_session_func(*args):
-            """
-            Passed to the session to call when destroy.
-            """
-            self.pop_session_dict(session_id)
+        # Clean up finished session processes.
+        self._cleanup_dead_sessions()
         
-        session = Session(
-            self,
-            SessionInfo(self.server_info.address, session_id),
-            exit_callbacks=[destroy_session_func]
-        )
         if session_id in self.session_dict:
             logger.warning(
                 f'Session_id {session_id} already exists and the creation will be ignored.'
             )
             return
         
-        self.session_dict[session_id] = session
-        session.start()
+        process = Process(
+            target=_session_process_entry,
+            args=(self.server_info.address, session_id, self.max_cmds),
+            daemon=False
+        )
+        self.session_dict[session_id] = process
+        process.start()
     
     @action_registry(key='destroy_session')
     @param_check(required=('session_id',))
@@ -270,9 +262,13 @@ class Server(
                 f'Session id {session_id} not in the session dict.'
             )
             return
-        session = self.session_dict[session_id]
-        state = session.session_state
-        state.destroy_local.set()
+        destroy_fp = SessionInfo(
+            self.server_info.address, session_id
+        ).destroy_session_fp
+        try:
+            create_symbol(destroy_fp)
+        except Exception:
+            pass
     
     @action_registry(key='server_shutdown')
     def server_shutdown(self, msg: Message):
@@ -281,8 +277,15 @@ class Server(
         )
         raise ServerShutdown
     
-    def pop_session_dict(self, session_id: str):
-        return self.session_dict.pop(session_id, None)
+    def _cleanup_dead_sessions(self):
+        """Remove finished session processes from the dict."""
+        dead = [
+            sid for sid, proc in self.session_dict.items()
+            if not proc.is_alive()
+        ]
+        for sid in dead:
+            proc = self.session_dict.pop(sid)
+            proc.join(timeout=1)
     
     def check_action_result(self, res: Union[None, Tuple[str, ...]]):
         if res is None: pass
@@ -297,16 +300,21 @@ class Server(
 
 class Session(
     LifecycleRun,
-    Thread,
     Connection,
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
     """
     One session can only run one command at the same time.
+    
+    Each ``Session`` runs in its own child process (via 
+    ``_session_process_entry``). ``SessionCommand`` threads run 
+    within the session process, so ``os.fork`` / ``os.forkpty`` 
+    called by subprocesses or pexpect only contend with the few 
+    threads inside this process, avoiding the deadlock risk of 
+    forking a heavily-threaded server process.
     """
     readonly_attr__ = (
-        'server',
         'session_info',
         'session_state',
         'heartbeat',
@@ -314,7 +322,8 @@ class Session(
         'background_cmds',
         'created_timestamp',
         'session_listener',
-        'client_writer'
+        'client_writer',
+        'cmd_pool'
     )
     
     # Dispatch different message types.
@@ -322,13 +331,11 @@ class Session(
     
     def __init__(
         self,
-        server: Server,
         session_info: SessionInfo,
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
+        max_cmds: Union[int, None] = None
     ) -> None:
         LifecycleRun.__init__(self, exit_callbacks)
-        Thread.__init__(self)
-        self.server = server
         self.session_info = session_info
         self.session_state = SessionState()
         self.heartbeat = Heartbeat(
@@ -345,11 +352,9 @@ class Session(
         # Message communication
         self.session_listener = MessageChannel(self.session_info.session_queue_namespace)
         self.client_writer = MessageChannel(self.session_info.client_queue_namespace)
+        # Per-session command pool (replaces the shared server pool).
+        self.cmd_pool = CommandPool(max_cmds)
         logger.info(f'Session {self.session_id} created.')
-    
-    @property
-    def cmd_pool(self) -> CommandPool:
-        return self.server.cmd_pool
     
     @property
     def session_id(self) -> str:
@@ -360,7 +365,12 @@ class Session(
     #
     
     def before_running(self) -> bool:
-        return self.connect()
+        self.cmd_pool.start()
+        if not self.connect():
+            self.cmd_pool.close()
+            self.cmd_pool.polling_thread.join()
+            return False
+        return True
     
     def running(self):
         # Send the server version.
@@ -377,6 +387,7 @@ class Session(
         action_registry = self.action_registry
         
         for _ in polling():
+            self._reap_finished_cmd()
             if not to_be_destroyed:
                 to_be_destroyed = (not self.check_connection())
             
@@ -398,16 +409,25 @@ class Session(
         # Further confirm the command is terminated.
         self.safely_terminate_cmd(cause='destroy')
         self.clear_cache()
-        # Kill all the background commands.
+        # Signal all background commands to force-kill via cross-process
+        # Events (the executor lives inside the child process).
         for back_cmd in tuple(self.background_cmds.update_and_get()):
-            back_cmd.executor.kill()
+            back_cmd.cmd_state.force_kill.set()
         
         # Wait all the commands to finish.
         running_cmd = self.running_cmd
         if running_cmd:
-            running_cmd.join()
+            running_cmd.join(config.server_shutdown_wait_timeout)
+            if running_cmd.is_alive():
+                running_cmd.terminate_runner()
         for back_cmd in tuple(self.background_cmds.update_and_get()):
-            back_cmd.join()
+            back_cmd.join(config.server_shutdown_wait_timeout)
+            if back_cmd.is_alive():
+                back_cmd.terminate_runner()
+        
+        # Shut down the per-session command pool.
+        self.cmd_pool.close()
+        self.cmd_pool.polling_thread.join()
     
     #
     # Actions.
@@ -672,14 +692,13 @@ class Session(
     
     def check_connection(self) -> bool:
         disconn_session_fp = self.session_info.disconn_session_fp
-        session_state = self.session_state
         
         with self.running_cmd_lock:
             if check_symbol(disconn_session_fp):
                 self.disconnect(initiator=False)
                 return False
             elif (
-                session_state.destroy_local.is_set() or 
+                os.path.exists(self.session_info.destroy_session_fp) or 
                 not self.heartbeat.beat()
             ):
                 self.disconnect(initiator=True)
@@ -689,6 +708,18 @@ class Session(
     #
     # Other methods.
     #
+    
+    def _reap_finished_cmd(self):
+        """
+        Detect that the running command's child process has finished
+        and clean up the ``running_cmd`` reference.  For ShellCommands
+        the exit callbacks are NOT triggered by LifecycleRun (they live
+        in a different process), so we handle the cleanup here.
+        """
+        with self.running_cmd_lock:
+            cmd = self.running_cmd
+            if cmd is not None and cmd.cmd_state.exit.is_set():
+                self.running_cmd = None
     
     def clear_cache(self):
         """
@@ -752,18 +783,95 @@ class Session(
 # Commands
 #
 
-# TODO: We are considering changing the ``SessionCommand`` from a ``Thread`` to a 
-# ``Process``, because ``os.fork`` and ``os.forkpty`` may cause deadlock in the 
-# multithreading mode (and the usage is deprecated since Python 3.12). This problem 
-# may involve the ``pexpect`` module.
+def _session_process_entry(
+    address: str,
+    session_id: str,
+    max_cmds: Union[int, None] = None
+):
+    """
+    Entry point for a session child process. Creates a ``Session`` 
+    entirely within the child process (no pickling required) and 
+    runs its lifecycle.
+    """
+    session_info = SessionInfo(address, session_id)
+    session = Session(
+        session_info=session_info,
+        max_cmds=max_cmds
+    )
+    session.run()
+
+
+class _SessionProxy:
+    """
+    Lightweight stand-in for ``Session`` used inside command child
+    processes.  Provides only the interface that ``SessionCommand``
+    (and its subclasses) read through ``self.session``.
+    """
+    
+    def __init__(self, session_info: SessionInfo, client_queue_namespace: str):
+        self.session_info = session_info
+        self.client_writer = MessageChannel(client_queue_namespace)
+    
+    def send_msg_to_client(self, type: str, content: Union[dict, None] = None):
+        self.client_writer.write(
+            Message(
+                session_id=self.session_info.session_id,
+                type=type,
+                content=content
+            )
+        )
+    
+    def info_client(self, info: str):
+        return self.send_msg_to_client(type='info', content={'info': info})
+
+
+_SHELL_COMMAND_CLASSES = {}
+
+
+def _shell_command_process_entry(
+    address: str,
+    session_id: str,
+    client_queue_namespace: str,
+    msg_json: str,
+    cmd_state: CommandState,
+    command_type: str,
+):
+    """
+    Entry point for a shell-command child process.
+
+    Constructs a fresh ``PopenShellCommand`` / ``PexpectShellCommand``
+    from primitive (picklable) data and runs its full lifecycle.
+    The process contains only a single thread, making any subsequent
+    ``os.fork`` / ``os.forkpty`` completely safe.
+    """
+    session_info = SessionInfo(address, session_id)
+    msg = CommandMessage.from_json(msg_json)
+    proxy = _SessionProxy(session_info, client_queue_namespace)
+    
+    cmd_cls = _SHELL_COMMAND_CLASSES.get(command_type)
+    if cmd_cls is None:
+        raise ValueError(f'Unknown command type: {command_type}')
+    
+    cmd = cmd_cls(
+        session=proxy,
+        msg=msg,
+        cmd_state=cmd_state
+    )
+    cmd.run()
+
+
 class SessionCommand(
     LifecycleRun,
-    Thread,
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
     """
     Start running a new command in the session.
+    
+    No longer inherits ``Thread``.  Subclasses decide how to run:
+    
+    * ``ShellCommand`` → child ``Process`` (fork-safe: single-threaded)
+    * ``InnerCommand`` → child ``Thread`` (no fork involved)
     """
     readonly_attr__ = (
         'session',
@@ -775,19 +883,19 @@ class SessionCommand(
     
     def __init__(
         self,
-        session: Session,
+        session: "Union[Session, _SessionProxy]",
         msg: Message,
         exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
-        executor: Union[Executor, Nothing] = NOTHING
+        executor: Union[Executor, Nothing] = NOTHING,
+        cmd_state: Union[CommandState, None] = None
     ):
         LifecycleRun.__init__(self, exit_callbacks)
-        Thread.__init__(self)
         self.session = session
         self.msg = CommandMessage.clone(msg)
-        # The running process executor (if any).
         self.executor = executor
-        self.cmd_state = CommandState()
+        self.cmd_state = cmd_state if cmd_state is not None else CommandState()
         self.output_writer = OutputFileHandler(self.output_namespace)
+        self._runner: Union[Thread, Process, None] = None
     
     @property
     def session_info(self) -> SessionInfo:
@@ -812,6 +920,27 @@ class SessionCommand(
     @property
     def info_client(self):
         return self.session.info_client
+    
+    #
+    # Runner management (replaces Thread.start / join / is_alive).
+    #
+    
+    def start(self):
+        raise NotImplementedError(
+            'Subclasses must override start() to create a Thread or Process.'
+        )
+    
+    def join(self, timeout=None):
+        if self._runner is not None:
+            self._runner.join(timeout)
+    
+    def is_alive(self):
+        return self._runner is not None and self._runner.is_alive()
+    
+    def terminate_runner(self):
+        """Force-terminate the underlying process if applicable."""
+        if self._runner is not None and hasattr(self._runner, 'terminate'):
+            self._runner.terminate()
     
     #
     # Running operations.
@@ -915,27 +1044,49 @@ class SessionCommand(
 class ShellCommand(SessionCommand):
     """
     Start a new shell command.
+    
+    Execution happens in a dedicated child ``Process`` so that any
+    ``os.fork`` / ``os.forkpty`` calls occur in a single-threaded
+    process, completely avoiding the deprecated multi-threaded fork
+    path (Python 3.12+).
     """
+    _command_type: str = ''
     
     def __init__(
         self,
-        session: Session,
+        session: "Union[Session, _SessionProxy]",
         msg: Message,
         exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
-        executor: Union[Executor, Nothing] = NOTHING
+        executor: Union[Executor, Nothing] = NOTHING,
+        cmd_state: Union[CommandState, None] = None
     ):
         SessionCommand.__init__(
             self,
             session=session,
             msg=msg,
             exit_callbacks=exit_callbacks,
-            executor=executor
+            executor=executor,
+            cmd_state=cmd_state
         )
-        # NOTE: This should be called after the Message object has been converted to 
-        # a CommandMessage object in SessionCommand.
         if self.msg.kill_disabled:
-            # Set kill disabled.
             self.cmd_state.kill_disabled.set()
+    
+    def start(self):
+        """Spawn a child process for the shell command."""
+        si = self.session.session_info
+        self._runner = Process(
+            target=_shell_command_process_entry,
+            args=(
+                si.address,
+                si.session_id,
+                self.session.client_writer.namespace,
+                self.msg.to_json(),
+                self.cmd_state,
+                self._command_type,
+            ),
+            daemon=True
+        )
+        self._runner.start()
     
     def running(self) -> None:
         # Start the command exec.
@@ -1032,12 +1183,14 @@ class PopenShellCommand(ShellCommand):
     """
     Start a new shell command using Popen.
     """
+    _command_type = 'popen'
     
     def __init__(
         self,
-        session: Session,
+        session: "Union[Session, _SessionProxy]",
         msg: Message,
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
+        cmd_state: Union[CommandState, None] = None
     ):
         content: dict = msg.content
         encoding: str = content['encoding'] or config.cmd_pipe_encoding
@@ -1045,7 +1198,6 @@ class PopenShellCommand(ShellCommand):
         writer: PopenWriter = popen_writer_registry.get(content['writer'], PopenWriter)()
         exec: Union[str, None] = content['exec'] or config.cmd_executable
         platform: str = content['platform'] or config.platform
-        # Create Executor object.
         executor = platform_open_executor_registry.get(platform, DefaultPopenExecutor)(
             popen_params=FuncParams(
                 content['cmd'],
@@ -1066,7 +1218,8 @@ class PopenShellCommand(ShellCommand):
             session=session,
             msg=msg,
             exit_callbacks=exit_callbacks,
-            executor=executor
+            executor=executor,
+            cmd_state=cmd_state
         )
 
 
@@ -1074,12 +1227,14 @@ class PexpectShellCommand(ShellCommand):
     """
     Start a new shell command using pexpect.
     """
+    _command_type = 'pexpect'
     
     def __init__(
         self,
-        session: Session,
+        session: "Union[Session, _SessionProxy]",
         msg: Message,
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
+        cmd_state: Union[CommandState, None] = None
     ):
         content: dict = msg.content
         reader: PexpectReader = pexpect_reader_registry.get(content['reader'], DefaultPexpectReader)()
@@ -1097,16 +1252,28 @@ class PexpectShellCommand(ShellCommand):
             session=session,
             msg=msg,
             exit_callbacks=exit_callbacks,
-            executor=executor
+            executor=executor,
+            cmd_state=cmd_state
         )
+
+
+_SHELL_COMMAND_CLASSES['popen'] = PopenShellCommand
+_SHELL_COMMAND_CLASSES['pexpect'] = PexpectShellCommand
 
 
 class InnerCommand(SessionCommand):
     """
     Start an Inner Command.
+    
+    Runs as a ``Thread`` inside the session process (no fork involved).
     """
     
     inner_cmd_registry = Registry[Callable[[Any], None]]('inner_cmd_registry')
+    
+    def start(self):
+        """Run as a thread — inner commands never fork."""
+        self._runner = Thread(target=self.run)
+        self._runner.start()
     
     def running(self):
         msg = self.msg
@@ -1142,14 +1309,21 @@ class InnerCommand(SessionCommand):
     @inner_cmd_registry(key='ls-session')
     def list_session(self):
         output_writer = self.output_writer
-        sessions = tuple(self.session.server.session_dict.values())
-        if len(sessions) == 0:
-            # This may never be executed.
+        address = self.session_info.address
+        try:
+            session_dirs = [
+                d for d in os.listdir(address)
+                if d.endswith(SESSION_ID_SUFFIX) and
+                os.path.isdir(os.path.join(address, d))
+            ]
+        except OSError:
+            session_dirs = []
+        if len(session_dirs) == 0:
             output_writer.print('(No sessions running)')
             return
         output_writer.print('>>> Sessions:')
-        for index, session in enumerate(sessions):
-            output_writer.print(f'({index}) {str(session)}')
+        for index, sid in enumerate(session_dirs):
+            output_writer.print(f'({index}) Session(session_id="{sid}")')
     
     @inner_cmd_registry(key='ls-cmd')
     def list_cmd(self):

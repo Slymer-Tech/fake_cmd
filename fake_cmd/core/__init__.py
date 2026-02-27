@@ -102,6 +102,8 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         # Heartbeat.
         self.heartbeat_session_fp = self.concat_session_path('session.heartbeat')
         self.heartbeat_client_fp = self.concat_session_path('client.heartbeat')
+        # Destroy signal (file-based, for cross-process signaling).
+        self.destroy_session_fp = self.concat_session_path('session.destroy')
     
     @property
     def session_namespace(self) -> str:
