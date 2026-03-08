@@ -1,12 +1,9 @@
-from slime_core.utils.typing import (
-    Union,
-    Tuple
-)
+from slime_core.utils.typing import Union, Tuple
 from fake_cmd import __version__
 
 
 class Config:
-    
+
     def __init__(self) -> None:
         # Common polling interval
         self.polling_interval: float = 0.25
@@ -28,9 +25,9 @@ class Config:
         # truncates it.  Default: 50 MiB.
         self.max_output_file_bytes: int = 50 * 1024 * 1024
         # command pipe output encoding method.
-        self.cmd_pipe_encoding: str = 'utf-8'
+        self.cmd_pipe_encoding: str = "utf-8"
         self.cmd_executable: Union[str, None] = None
-        # When ``kill_cmd`` is sent or client terminated, 
+        # When ``kill_cmd`` is sent or client terminated,
         # read the remaining content util timeout.
         self.cmd_client_read_timeout: float = 1.0
         self.cmd_pool_schedule_interval: float = 0.2
@@ -44,15 +41,17 @@ class Config:
         self.exception_retries: int = 3
         self.exception_wait_timeout: float = 0.5
         # Heartbeat settings.
-        # Create or check symbol at a random interval between 
+        # Create or check symbol at a random interval between
         # min and max, in order to reduce file conflicts.
         self.heartbeat_min_interval: float = 10.0
         self.heartbeat_max_interval: float = 20.0
         self.heartbeat_timeout: float = 600.0
         # The version info for compatibility check.
-        self.version: Tuple[int, int, int] = tuple(int(v) for v in __version__.split('.')[:3])
+        self.version: Tuple[int, int, int] = tuple(
+            int(v) for v in __version__.split(".")[:3]
+        )
         # For system settings.
-        self.platform: str = 'unix'
+        self.platform: str = "unix"
         self.posix_shlex: bool = True
 
 
@@ -64,7 +63,7 @@ def version_check(
     *,
     min_version: Union[Tuple[int, int, int], None] = None,
     max_version: Union[Tuple[int, int, int], None] = None,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> bool:
     """
     Check whether the server version is compatible with some client
@@ -75,17 +74,17 @@ def version_check(
         check_passed = False
     else:
         version = tuple(version)
-        check_passed = (
-            ((not min_version) or version >= tuple(min_version)) and 
-            ((not max_version) or version <= tuple(max_version))
+        check_passed = ((not min_version) or version >= tuple(min_version)) and (
+            (not max_version) or version <= tuple(max_version)
         )
-    
+
     if not check_passed and verbose:
         from .logging import logger
+
         logger.warning(
-            f'Version check failed, expected version: '
-            f'min: {min_version}, max: {max_version}, actual '
-            f'version: {version}. You may need to get the '
-            'latest updates.'
+            f"Version check failed, expected version: "
+            f"min: {min_version}, max: {max_version}, actual "
+            f"version: {version}. You may need to get the "
+            "latest updates."
         )
     return check_passed

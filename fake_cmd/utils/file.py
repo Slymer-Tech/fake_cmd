@@ -1,6 +1,7 @@
 """
 File operations.
 """
+
 import os
 import shutil
 from .exception import retry_deco
@@ -24,4 +25,4 @@ def remove_dir_with_retry(namespace: str):
 
 # Kept for backward compatibility: ``detect_files()`` filters out
 # stale ``.writing`` files that may linger from older versions.
-SINGLE_WRITER_LOCK_FILE_EXTENSION = 'writing'
+SINGLE_WRITER_LOCK_FILE_EXTENSION = "writing"

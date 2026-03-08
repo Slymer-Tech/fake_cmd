@@ -35,8 +35,8 @@ On the server computer which you want to run your code on, start the server as f
 ```Python
 from fake_cmd.core.server import Server
 
-if __name__ == '__main__':
-    Server('/specify/a/hard/disk/path/here').run()
+if __name__ == "__main__":
+    Server("/specify/a/hard/disk/path/here").run()
 ```
 
 On the client, start the client as follows:
@@ -44,8 +44,18 @@ On the client, start the client as follows:
 ```Python
 from fake_cmd.core.client import CLI
 
-if __name__ == '__main__':
-    CLI('/same/path/as/the/server').run()
+if __name__ == "__main__":
+    CLI("/same/path/as/the/server").run()
+```
+
+Alternatively, after installation you can start the server and client via commands:
+
+```bash
+# Start the server with address as a positional argument
+fake-cmd-server /specify/a/hard/disk/path/here --max_cmds 8
+
+# Start the client with address as a positional argument
+fake-cmd-client /same/path/as/the/server --id_prefix abc
 ```
 
 ## Usage
